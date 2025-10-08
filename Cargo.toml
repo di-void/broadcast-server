@@ -1,0 +1,9 @@
+[package]
+name = "broadcast-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+async-tungstenite = "0.31.0"
+clap = "4.5.48"
+smol = "2.0.2"
