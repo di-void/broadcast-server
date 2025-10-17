@@ -1,25 +1,23 @@
+use async_tungstenite::accept_async;
 use async_tungstenite::tungstenite::Message;
-use async_tungstenite::{WebSocketStream, accept_async};
 use rand::prelude::*;
 use smol::{
-    self, Timer, channel,
-    lock::RwLock,
-    net::{TcpListener, TcpStream},
+    self,
+    channel::{self, Sender},
+    lock::Mutex,
+    net::TcpListener,
     stream::StreamExt,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 use std::{io, net::SocketAddr};
-
-// mod buf;
 
 #[derive(Debug)]
 struct Client {
-    id: u16, // maybe redundant?
+    id: u16,
     is_active: bool,
     is_connected: bool,
-    ws_stream: WebSocketStream<TcpStream>,
+    sender: Sender<Message>,
 }
 
 #[derive(Debug)]
@@ -27,7 +25,6 @@ struct ChannelMessage {
     client_id: u16,
     message: Message,
 }
-// - to avoid runaway memory, message buffer should be bounded // 2kb?
 // - evict disconnected clients from state
 
 pub async fn start() -> io::Result<()> {
@@ -39,7 +36,7 @@ pub async fn start() -> io::Result<()> {
     let ids = (1..=100).collect::<Vec<u16>>(); // client id pool
 
     let registry: HashMap<u16, Client> = HashMap::new();
-    let registry_lock = Arc::new(RwLock::new(registry));
+    let registry_lock = Arc::new(Mutex::new(registry));
     let (tx, rx) = channel::unbounded::<ChannelMessage>();
 
     let reg_lock = Arc::clone(&registry_lock);
@@ -48,19 +45,15 @@ pub async fn start() -> io::Result<()> {
         println!("Broker is active!");
 
         loop {
-            // let msg = rx.recv_async().await.unwrap();
             let msg = rx.recv().await.unwrap();
-            println!("Broker received msg: {:#?}", &msg);
-            // consume message from mpsc channel
+            let mut guard = reg_lock.lock().await;
+            println!("Broker has acquired lock!");
 
-            let mut writer = reg_lock.write_arc().await;
-            println!("Broker has acquired write-lock!");
-
-            for (_, client) in writer.iter_mut() {
-                // except client with received client id
+            for (_, client) in guard.iter_mut() {
                 if client.id != msg.client_id {
                     println!("Sending to client {}", client.id);
-                    client.ws_stream.send(msg.message.clone()).await.unwrap();
+                    client.sender.send(msg.message.clone()).await.unwrap();
+                    println!("Sent!");
                 }
             }
         }
@@ -73,21 +66,32 @@ pub async fn start() -> io::Result<()> {
 
         println!("Starting websocket session!");
         let ws_stream = accept_async(stream).await.unwrap();
+        let (mut ws_sender, mut ws_receiver) = ws_stream.split();
         let client_id = ids.choose(&mut rng).unwrap().to_owned();
+        let (b_tx, b_rx) = channel::bounded(2);
 
         let new_connection = Client {
             id: client_id,
             is_active: true,
             is_connected: true,
-            ws_stream,
+            sender: b_tx,
         };
 
-        let mut registry_writer = registry_lock.write_arc().await;
+        let mut registry_writer = registry_lock.lock().await;
         registry_writer.insert(client_id, new_connection);
         drop(registry_writer); // release write lock
 
-        let reg_lock = Arc::clone(&registry_lock);
         let sender = tx.clone();
+
+        smol::spawn(async move {
+            // respond to broadcast
+            loop {
+                let msg = b_rx.recv().await.unwrap();
+                ws_sender.send(msg).await.unwrap();
+            }
+        })
+        .detach();
+
         smol::spawn(async move {
             println!("Client {client_id} has spawned into action");
 
@@ -98,13 +102,8 @@ pub async fn start() -> io::Result<()> {
             // to acquire a lock for some time
 
             loop {
-                let mut writer = reg_lock.write_arc().await;
-                println!("Client {client_id} has acquired write-lock!");
-
                 // read a message from ws stream
-                let client = writer.get_mut(&c_id).unwrap();
-                if let Some(msg) = client.ws_stream.next().await {
-                    println!("Client {} got new message: {:#?}", c_id, &msg);
+                if let Some(msg) = ws_receiver.next().await {
                     let msg = msg.unwrap();
 
                     let channel_msg: ChannelMessage = ChannelMessage {
@@ -112,22 +111,10 @@ pub async fn start() -> io::Result<()> {
                         message: msg,
                     };
 
-                    println!(
-                        "Client {} sending message to broker: {:#?}",
-                        c_id, &channel_msg
-                    );
-
                     tx.send_blocking(channel_msg).unwrap(); // deadlock?
-                    drop(writer); // release write-lock
-
-                    // allow other writers to progress
-                    Timer::after(Duration::from_millis(800)).await;
-
-                    Some(())
                 } else {
-                    // stream has finished
                     break;
-                };
+                }
             }
         })
         .detach();
