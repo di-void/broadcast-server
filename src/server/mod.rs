@@ -1,6 +1,5 @@
 use async_tungstenite::accept_async;
 use async_tungstenite::tungstenite::Message;
-use rand::prelude::*;
 use smol::{
     self, Task,
     channel::{self, Sender},
@@ -14,26 +13,24 @@ use std::{io, net::SocketAddr};
 
 #[derive(Debug)]
 struct Client {
-    id: u16,
+    id: u8,
     sender: Sender<Message>,
 }
 
 #[derive(Debug)]
 enum ChannelMessage {
-    Text(u16, Message),
-    Close(u16),
+    Text(u8, Message),
+    Close(u8),
 }
 
 pub async fn start() -> io::Result<()> {
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 8080))).await?;
     let mut incoming = listener.incoming();
     println!("Server is listening on port 8080!");
+    let mut cc: u8 = 0; // client count; max of 255
 
-    let mut rng = rand::rng();
-    let ids = (1..=100).collect::<Vec<u16>>(); // client id pool
-
-    let registry: HashMap<u16, Client> = HashMap::new();
-    let tasks_table: HashMap<u16, Task<()>> = HashMap::new();
+    let registry: HashMap<u8, Client> = HashMap::new();
+    let tasks_table: HashMap<u8, Task<()>> = HashMap::new();
     let registry_lock = Arc::new(Mutex::new(registry));
     let tasks_table_lock = Arc::new(Mutex::new(tasks_table));
     let (tx, rx) = channel::unbounded::<ChannelMessage>();
@@ -66,7 +63,7 @@ pub async fn start() -> io::Result<()> {
 
                     let task = tasks_table_guard.remove(&client_id).unwrap();
                     task.cancel().await; // could deadlock?
-                    println!("Main task for client {client_id} has been cancelled");
+                    println!("Main handler task for client {client_id} has been cancelled");
                 }
             }
         }
@@ -80,9 +77,11 @@ pub async fn start() -> io::Result<()> {
         println!("Starting websocket session!");
         let ws_stream = accept_async(stream).await.unwrap();
         let (mut ws_sender, mut ws_receiver) = ws_stream.split();
-        let client_id = ids.choose(&mut rng).unwrap().to_owned();
+        let client_id = {
+            cc += 1;
+            cc
+        };
         let (b_tx, b_rx) = channel::bounded(2);
-
         let new_connection = Client {
             id: client_id,
             sender: b_tx,
@@ -103,7 +102,7 @@ pub async fn start() -> io::Result<()> {
         });
 
         let reg_lock2 = Arc::clone(&registry_lock);
-        let main_task = smol::spawn(async move {
+        let main_handler = smol::spawn(async move {
             println!("Client {client_id} has spawned into action");
 
             let c_id = client_id;
@@ -120,8 +119,6 @@ pub async fn start() -> io::Result<()> {
                             } else if msg.is_close() {
                                 let mut w = reg_lock2.lock().await;
                                 let _ = w.remove(&c_id); // remove client from registry
-                                drop(w); // releast mutex lock
-
                                 bcast_handler_task.cancel().await; // clean up
                                 println!(
                                     "Broadcast handler task for client {c_id} has been cancelled"
@@ -134,9 +131,7 @@ pub async fn start() -> io::Result<()> {
                             println!("Something went wrong: {:?}", e);
 
                             let mut w = reg_lock2.lock().await;
-                            let _ = w.remove(&c_id); // remove client from registry
-                            drop(w); // releast mutex lock
-
+                            let _ = w.remove(&c_id);
                             bcast_handler_task.cancel().await; // clean up
                             println!("Broadcast handler task for client {c_id} has been cancelled");
                             tx.send_blocking(ChannelMessage::Close(c_id)).unwrap();
@@ -148,7 +143,7 @@ pub async fn start() -> io::Result<()> {
         });
 
         let mut tasks_table_guard = tasks_table_lock.lock().await;
-        tasks_table_guard.insert(client_id, main_task);
+        tasks_table_guard.insert(client_id, main_handler);
     }
 
     Ok(())
