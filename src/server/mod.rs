@@ -21,7 +21,7 @@ struct Client {
 #[derive(Debug)]
 enum ChannelMessage {
     Text(u16, Message),
-    Closure(u16),
+    Close(u16),
 }
 
 pub async fn start() -> io::Result<()> {
@@ -60,7 +60,7 @@ pub async fn start() -> io::Result<()> {
                         }
                     }
                 }
-                ChannelMessage::Closure(client_id) => {
+                ChannelMessage::Close(client_id) => {
                     let mut tasks_table_guard = tasks_lock.lock().await;
                     println!("Broker has acquired tasks table lock!");
 
@@ -126,7 +126,7 @@ pub async fn start() -> io::Result<()> {
                                 println!(
                                     "Broadcast handler task for client {c_id} has been cancelled"
                                 );
-                                tx.send_blocking(ChannelMessage::Closure(c_id)).unwrap();
+                                tx.send_blocking(ChannelMessage::Close(c_id)).unwrap();
                                 break;
                             }
                         }
@@ -139,7 +139,7 @@ pub async fn start() -> io::Result<()> {
 
                             bcast_handler_task.cancel().await; // clean up
                             println!("Broadcast handler task for client {c_id} has been cancelled");
-                            tx.send_blocking(ChannelMessage::Closure(c_id)).unwrap();
+                            tx.send_blocking(ChannelMessage::Close(c_id)).unwrap();
                             break;
                         }
                     }
