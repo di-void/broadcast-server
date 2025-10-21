@@ -11,7 +11,6 @@ use smol::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
-// use std::sync::atomic::{AtomicBool, Ordering};
 use std::{io, net::SocketAddr};
 
 #[derive(Debug)]
@@ -33,7 +32,7 @@ pub async fn start() -> io::Result<()> {
     let registry_lock = Arc::new(Mutex::new(registry));
     let tasks_table_lock = Arc::new(Mutex::new(tasks_table));
     let (tx, rx) = channel::unbounded::<ChannelMessage>();
-    let (sd_tx, sd_rx) = channel::bounded(1);
+    let (sd_tx, shutdown) = channel::bounded(1);
 
     let reg_lock = Arc::clone(&registry_lock);
     let tasks_lock = Arc::clone(&tasks_table_lock);
@@ -76,8 +75,7 @@ pub async fn start() -> io::Result<()> {
                     println!("Shutting down!!");
                     let mut reg_lock_guard = reg_lock.lock().await;
                     let mut tasks_table_guard = tasks_lock.lock().await;
-                    println!("Broker has acquired locks!");
-                    // loop through a connected clients closing them
+
                     for (_, client) in reg_lock_guard.iter_mut() {
                         client
                             .sender
@@ -88,6 +86,7 @@ pub async fn start() -> io::Result<()> {
                             .await
                             .unwrap();
                     }
+
                     let tkeys = tasks_table_guard
                         .keys()
                         .map(|k| k.to_owned())
@@ -194,7 +193,7 @@ pub async fn start() -> io::Result<()> {
         }
     });
 
-    let _ = sd_rx.recv().await.unwrap();
+    let _ = shutdown.recv().await.unwrap();
     main_task.cancel().await;
     broker_task.cancel().await;
 
